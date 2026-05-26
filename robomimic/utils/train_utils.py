@@ -433,7 +433,7 @@ def run_rollout(
             # visualization
             if video_writer is not None:
                 if video_count % video_skip == 0:
-                    frame = env.render(mode="rgb_array", height=256, width=256)
+                    frame = env.render(mode="rgb_array", height=128, width=128)
                     video_frames.append(frame)
 
                 video_count += 1
@@ -933,7 +933,6 @@ def should_save_from_rollout_logs(
             best_success_rate[env_name] = rollout_logs["Success_Rate"]
             if save_on_best_rollout_success_rate:
                 # save checkpoint if achieve new best success rate
-                epoch_ckpt_name += "_{}_success_{}".format(env_name, best_success_rate[env_name])
                 should_save_ckpt = True
                 ckpt_reason = "success"
 

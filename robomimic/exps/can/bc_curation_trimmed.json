@@ -1,7 +1,7 @@
 {
     "algo_name": "bc",
     "experiment": {
-        "name": "core_bc_can_mh_image_seed5",
+        "name": "can_trimmed_seed5",
         "validate": true,
         "logging": {
             "terminal_output_to_txt": true,
@@ -37,7 +37,7 @@
         "ckpt_path": null
     },
     "train": {
-        "data": "/home/zzae/sj/data/robomimic/can/mh/image.hdf5",
+        "data": "/home/zzae/sj/data/robomimic/can/mh/image_gp_trim80_chunk20.hdf5",
         "output_dir": "ckpt/can_model",
         "normalize_weights_by_ds_size": false,
         "num_data_workers": 2,
