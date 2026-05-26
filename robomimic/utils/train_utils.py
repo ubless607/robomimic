@@ -8,24 +8,103 @@ import time
 import datetime
 import shutil
 import json
+import multiprocessing as mp
+import faulthandler
+import signal
 import h5py
 import imageio
 import numpy as np
 from copy import deepcopy
 from collections import OrderedDict
+import tempfile
+import traceback
 
 import torch
 
 import robomimic
 import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.utils.log_utils as LogUtils
+import robomimic.utils.env_utils as EnvUtils
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.lang_utils as LangUtils
+import robomimic.utils.obs_utils as ObsUtils
+from robomimic.config.config import Config
 
 from robomimic.utils.dataset import SequenceDataset, MetaDataset
 from robomimic.envs.env_base import EnvBase
-from robomimic.envs.wrappers import EnvWrapper
-from robomimic.algo import RolloutPolicy
+from robomimic.envs.wrappers import EnvWrapper, FrameStackWrapper
+from robomimic.algo import RolloutPolicy, algo_factory
+from robomimic.config.base_config import config_factory
+
+
+_WORKER_ROLLOUT_POLICY = None
+_WORKER_ROLLOUT_ENV = None
+
+
+def _to_plain_python(value):
+    """
+    Recursively convert nested config-like containers to plain Python types.
+    """
+    if isinstance(value, Config):
+        return {k: _to_plain_python(v) for k, v in value.items()}
+    if isinstance(value, dict):
+        return {k: _to_plain_python(v) for k, v in value.items()}
+    if isinstance(value, OrderedDict):
+        return OrderedDict((k, _to_plain_python(v)) for k, v in value.items())
+    if isinstance(value, list):
+        return [_to_plain_python(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_to_plain_python(v) for v in value)
+    return value
+
+
+def _write_worker_crash_log(prefix, exc):
+    """
+    Write a worker crash traceback to a temp file so pool failures are debuggable.
+    """
+    crash_path = os.path.join(tempfile.gettempdir(), "{}_{}.log".format(prefix, os.getpid()))
+    with open(crash_path, "w") as crash_file:
+        crash_file.write(traceback.format_exc())
+        crash_file.write("\nEXC: {}\n".format(repr(exc)))
+    print("worker crash log written to {}".format(crash_path), flush=True)
+
+
+def _init_rollout_worker(policy_state, algo_name, config_dict, obs_key_shapes, ac_dim, obs_normalization_stats, action_normalization_stats, device_str):
+    """
+    Initialize a worker-local rollout policy once per process.
+    """
+    global _WORKER_ROLLOUT_POLICY, _WORKER_ROLLOUT_ENV
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        faulthandler.enable()
+        torch.set_num_threads(1)
+        if hasattr(torch, "set_num_interop_threads"):
+            try:
+                torch.set_num_interop_threads(1)
+            except RuntimeError:
+                pass
+        device = torch.device(device_str)
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+        config = config_factory(algo_name, dic=deepcopy(_to_plain_python(config_dict)))
+        ObsUtils.initialize_obs_utils_with_config(config, verbose=False)
+        model = algo_factory(
+            algo_name=algo_name,
+            config=config,
+            obs_key_shapes=obs_key_shapes,
+            ac_dim=ac_dim,
+            device=device,
+        )
+        model.deserialize(policy_state, load_optimizers=False)
+        _WORKER_ROLLOUT_POLICY = RolloutPolicy(
+            model,
+            obs_normalization_stats=obs_normalization_stats,
+            action_normalization_stats=action_normalization_stats,
+        )
+        _WORKER_ROLLOUT_ENV = None
+    except Exception as exc:
+        _write_worker_crash_log("rollout_worker_init", exc)
+        raise
 
 
 def get_exp_dir(config, auto_remove_exp_dir=False, resume=False):
@@ -354,7 +433,7 @@ def run_rollout(
             # visualization
             if video_writer is not None:
                 if video_count % video_skip == 0:
-                    frame = env.render(mode="rgb_array", height=512, width=512)
+                    frame = env.render(mode="rgb_array", height=256, width=256)
                     video_frames.append(frame)
 
                 video_count += 1
@@ -387,6 +466,182 @@ def run_rollout(
     return results
 
 
+def _get_rollout_env_template(env):
+    """
+    Capture enough information from an environment to re-create rollout copies.
+    """
+    frame_stack_num_frames = None
+    while isinstance(env, FrameStackWrapper):
+        if frame_stack_num_frames is not None:
+            raise Exception("parallel rollout currently supports a single frame stack wrapper")
+        frame_stack_num_frames = env.num_frames
+        env = env.env
+
+    env_meta = env.serialize()
+    use_image_obs = bool(getattr(getattr(env, "env", None), "use_camera_obs", False))
+    use_depth_obs = bool(getattr(getattr(env, "env", None), "camera_depths", False))
+
+    return dict(
+        env_meta=env_meta,
+        use_image_obs=use_image_obs,
+        use_depth_obs=use_depth_obs,
+        frame_stack_num_frames=frame_stack_num_frames,
+    )
+
+
+def _clone_rollout_env(env_template, render_offscreen):
+    """
+    Create a fresh rollout environment from a captured template.
+    """
+    env = EnvUtils.create_env_from_metadata(
+        env_meta=deepcopy(env_template["env_meta"]),
+        render=False,
+        render_offscreen=render_offscreen,
+        use_image_obs=env_template["use_image_obs"],
+        use_depth_obs=env_template["use_depth_obs"],
+        verbose=False,
+    )
+    if env_template["frame_stack_num_frames"] is not None:
+        env = FrameStackWrapper(env, num_frames=env_template["frame_stack_num_frames"])
+    return env
+
+
+def _close_rollout_env(env):
+    """
+    Close a rollout environment if it exposes a close method.
+    """
+    env_close = getattr(env, "close", None)
+    if callable(env_close):
+        env_close()
+
+
+def _get_worker_rollout_env(env_template, render_offscreen):
+    """
+    Lazily create one rollout environment per worker process and reuse it.
+    """
+    global _WORKER_ROLLOUT_ENV
+    if _WORKER_ROLLOUT_ENV is None:
+        _WORKER_ROLLOUT_ENV = _clone_rollout_env(env_template, render_offscreen=render_offscreen)
+    return _WORKER_ROLLOUT_ENV
+
+
+def _run_rollout_chunk_worker(
+        env_template,
+        episode_indices,
+        env_key,
+        horizon,
+        use_goals,
+        render,
+        video_dir,
+        epoch,
+        video_skip,
+        terminate_on_success,
+    ):
+    """
+    Run a chunk of episodes using the worker-local rollout policy.
+    """
+    try:
+        assert _WORKER_ROLLOUT_POLICY is not None
+        return _run_rollout_chunk(
+            policy=_WORKER_ROLLOUT_POLICY,
+            env=_get_worker_rollout_env(env_template, render_offscreen=(video_dir is not None)),
+            episode_indices=episode_indices,
+            env_key=env_key,
+            horizon=horizon,
+            use_goals=use_goals,
+            render=render,
+            video_dir=video_dir,
+            epoch=epoch,
+            video_skip=video_skip,
+            terminate_on_success=terminate_on_success,
+            close_env=False,
+        )
+    except Exception as exc:
+        _write_worker_crash_log("rollout_worker_chunk", exc)
+        raise
+
+
+def _run_rollout_chunk_worker_star(args):
+    """
+    Multiprocessing helper that expands a packed argument tuple.
+    """
+    return _run_rollout_chunk_worker(*args)
+
+
+def _run_rollout_chunk(
+        policy,
+        env,
+        episode_indices,
+        env_key,
+        horizon,
+        use_goals,
+        render,
+        video_dir,
+        epoch,
+        video_skip,
+        terminate_on_success,
+        progress_bar=None,
+        close_env=True,
+    ):
+    """
+    Run a subset of rollouts for a single environment.
+    """
+    chunk_results = []
+    try:
+        for episode_index in episode_indices:
+            env_video_writer = None
+            episode_video_path = None
+            if video_dir is not None:
+                env_video_dir = os.path.join(video_dir, env_key)
+                os.makedirs(env_video_dir, exist_ok=True)
+                episode_video_path = os.path.join(
+                    env_video_dir,
+                    "epoch_{}_episode_{}.mp4".format(epoch, episode_index + 1),
+                )
+                env_video_writer = imageio.get_writer(episode_video_path, fps=20)
+
+            rollout_timestamp = time.time()
+            rollout_info = run_rollout(
+                policy=policy,
+                env=env,
+                horizon=horizon,
+                render=render,
+                use_goals=use_goals,
+                video_writer=env_video_writer,
+                video_skip=video_skip,
+                terminate_on_success=terminate_on_success,
+            )
+            rollout_info["time"] = time.time() - rollout_timestamp
+            if env_video_writer is not None:
+                env_video_writer.close()
+
+            chunk_results.append((episode_index, rollout_info, episode_video_path))
+            if progress_bar is not None:
+                progress_bar.update(1)
+    finally:
+        if close_env:
+            _close_rollout_env(env)
+
+    return chunk_results
+
+
+def _combine_video_files(output_path, input_paths, fps=20):
+    """
+    Combine a sequence of video files into a single output video.
+    """
+    writer = imageio.get_writer(output_path, fps=fps)
+    try:
+        for input_path in input_paths:
+            reader = imageio.get_reader(input_path)
+            try:
+                for frame in reader:
+                    writer.append_data(frame)
+            finally:
+                reader.close()
+    finally:
+        writer.close()
+
+
 def rollout_with_stats(
         policy,
         envs,
@@ -400,6 +655,7 @@ def rollout_with_stats(
         video_skip=5,
         terminate_on_success=False,
         verbose=False,
+        num_parallel_envs=1,
     ):
     """
     A helper function used in the train loop to conduct evaluation rollouts per environment
@@ -422,7 +678,9 @@ def rollout_with_stats(
 
         render (bool): if True, render the rollout to the screen
 
-        video_dir (str): if not None, dump rollout videos to this directory (one per environment)
+        video_dir (str): if not None, dump rollout videos to this directory. In serial mode this
+            is one video per environment; in parallel mode this is one video per episode under a
+            per-environment subdirectory.
 
         video_path (str): if not None, dump a single rollout video for all environments
 
@@ -431,6 +689,9 @@ def rollout_with_stats(
         video_skip (int): how often to write video frame
 
         terminate_on_success (bool): if True, terminate episode early as soon as a success is encountered
+
+        num_parallel_envs (int): number of parallel rollout workers to use per environment. If > 1,
+            rollout episodes are split across workers and each episode gets its own video file.
 
         verbose (bool): if True, print results of each rollout
     
@@ -441,11 +702,17 @@ def rollout_with_stats(
         video_paths (dict): path to rollout videos for each environment
     """
     assert isinstance(policy, RolloutPolicy)
+    assert num_episodes is not None and num_episodes > 0
+
+    num_parallel_envs = max(1, int(num_parallel_envs))
+    use_parallel = (num_parallel_envs > 1 and num_episodes > 1)
 
     all_rollout_logs = OrderedDict()
 
     # handle paths and create writers for video writing
     assert (video_path is None) or (video_dir is None), "rollout_with_stats: can't specify both video path and dir"
+    if use_parallel:
+        assert video_path is None, "parallel rollout currently supports video_dir only"
     write_video = (video_path is not None) or (video_dir is not None)
     video_paths = OrderedDict()
     video_writers = OrderedDict()
@@ -458,58 +725,153 @@ def rollout_with_stats(
         # video is written per env
         video_str = "_epoch_{}.mp4".format(epoch) if epoch is not None else ".mp4" 
         video_paths = { k : os.path.join(video_dir, "{}{}".format(k, video_str)) for k in envs }
-        video_writers = { k : imageio.get_writer(video_paths[k], fps=20) for k in envs }
+        if not use_parallel:
+            video_writers = { k : imageio.get_writer(video_paths[k], fps=20) for k in envs }
 
     for env_key, env in envs.items():
-        env_video_writer = None
-        if write_video:
-            print("video writes to " + video_paths[env_key])
-            env_video_writer = video_writers[env_key]
-
         env_name = env.name
 
         print("rollout: env={}, horizon={}, use_goals={}, num_episodes={}".format(
             env_name, horizon, use_goals, num_episodes,
         ))
+
+        if not use_parallel:
+            env_video_writer = None
+            if write_video:
+                print("video writes to " + video_paths[env_key])
+                env_video_writer = video_writers[env_key]
+
+            rollout_logs = []
+            iterator = range(num_episodes)
+            if not verbose:
+                iterator = LogUtils.custom_tqdm(iterator, total=num_episodes)
+
+            num_success = 0
+            for ep_i in iterator:
+                rollout_timestamp = time.time()
+                rollout_info = run_rollout(
+                    policy=policy,
+                    env=env,
+                    horizon=horizon,
+                    render=render,
+                    use_goals=use_goals,
+                    video_writer=env_video_writer,
+                    video_skip=video_skip,
+                    terminate_on_success=terminate_on_success,
+                )
+                rollout_info["time"] = time.time() - rollout_timestamp
+
+                rollout_logs.append(rollout_info)
+                num_success += rollout_info["Success_Rate"]
+
+                if verbose:
+                    print("Episode {}, horizon={}, num_success={}".format(ep_i + 1, horizon, num_success))
+                    print(json.dumps(rollout_info, sort_keys=True, indent=4))
+
+            if env_video_writer is not None and video_dir is not None:
+                env_video_writer.close()
+
+            rollout_logs = dict((k, [rollout_logs[i][k] for i in range(len(rollout_logs))]) for k in rollout_logs[0])
+            rollout_logs_mean = dict((k, np.mean(v)) for k, v in rollout_logs.items())
+            rollout_logs_mean["Time_Episode"] = np.sum(rollout_logs["time"]) / 60. # total time taken for rollouts in minutes
+            all_rollout_logs[env_key] = rollout_logs_mean
+            continue
+
+        env_template = _get_rollout_env_template(env)
+        num_workers = min(num_parallel_envs, num_episodes)
+        episode_chunks = [[episode_index] for episode_index in range(num_episodes)]
+        env_video_dir = None
+        if video_dir is not None:
+            env_video_dir = os.path.join(video_dir, env_key)
+            os.makedirs(env_video_dir, exist_ok=True)
+
         rollout_logs = []
-        iterator = range(num_episodes)
-        if not verbose:
-            iterator = LogUtils.custom_tqdm(iterator, total=num_episodes)
+        combined_video_path = video_paths[env_key] if video_dir is not None else None
+        temp_video_paths = []
+        base_model = policy.policy
+        policy_state = TensorUtils.to_device(TensorUtils.clone(base_model.nets.state_dict()), "cpu")
+        algo_name = base_model.global_config.algo_name
+        config_dict = _to_plain_python(base_model.global_config.to_dict())
+        obs_key_shapes = _to_plain_python(deepcopy(base_model.obs_key_shapes))
+        ac_dim = base_model.ac_dim
+        worker_device_str = str(base_model.device)
+        env_template = _to_plain_python(env_template)
+        obs_normalization_stats = _to_plain_python(policy.obs_normalization_stats)
+        action_normalization_stats = _to_plain_python(policy.action_normalization_stats)
 
+        with LogUtils.custom_tqdm(total=num_episodes, desc=env_name, dynamic_ncols=True, mininterval=0.0, miniters=1, leave=True) as progress_bar:
+            chunk_results = []
+            pool_context = mp.get_context("spawn")
+            with pool_context.Pool(
+                processes=num_workers,
+                initializer=_init_rollout_worker,
+                initargs=(
+                    policy_state,
+                    algo_name,
+                    config_dict,
+                    obs_key_shapes,
+                    ac_dim,
+                    obs_normalization_stats,
+                    action_normalization_stats,
+                    worker_device_str,
+                ),
+            ) as pool:
+                try:
+                    chunk_args = [
+                        (
+                            env_template,
+                            episode_chunk,
+                            env_key,
+                            horizon,
+                            use_goals,
+                            render,
+                            video_dir,
+                            epoch,
+                            video_skip,
+                            terminate_on_success,
+                        )
+                        for episode_chunk in episode_chunks
+                    ]
+
+                    for chunk_result in pool.imap_unordered(_run_rollout_chunk_worker_star, chunk_args, chunksize=1):
+                        chunk_results.extend(chunk_result)
+                        progress_bar.update(len(chunk_result))
+                        progress_bar.refresh()
+                except KeyboardInterrupt:
+                    pool.terminate()
+                    pool.join()
+                    raise
+
+        chunk_results.sort(key=lambda item: item[0])
         num_success = 0
-        for ep_i in iterator:
-            rollout_timestamp = time.time()
-            rollout_info = run_rollout(
-                policy=policy,
-                env=env,
-                horizon=horizon,
-                render=render,
-                use_goals=use_goals,
-                video_writer=env_video_writer,
-                video_skip=video_skip,
-                terminate_on_success=terminate_on_success,
-            )
-            rollout_info["time"] = time.time() - rollout_timestamp
-
+        for episode_index, rollout_info, episode_video_path in chunk_results:
+            rollout_info["time"] = rollout_info.get("time", rollout_info.get("Time_Episode", 0.0))
             rollout_logs.append(rollout_info)
+            if episode_video_path is not None:
+                temp_video_paths.append(episode_video_path)
             num_success += rollout_info["Success_Rate"]
-            
             if verbose:
-                print("Episode {}, horizon={}, num_success={}".format(ep_i + 1, horizon, num_success))
+                print("Episode {}, horizon={}, num_success={}".format(episode_index + 1, horizon, num_success))
                 print(json.dumps(rollout_info, sort_keys=True, indent=4))
 
-        if video_dir is not None:
-            # close this env's video writer (next env has it's own)
-            env_video_writer.close()
+        if combined_video_path is not None:
+            _combine_video_files(output_path=combined_video_path, input_paths=temp_video_paths, fps=20)
+            for temp_video_path in temp_video_paths:
+                if os.path.exists(temp_video_path):
+                    os.remove(temp_video_path)
+            assert video_dir is not None
+            temp_video_dir = os.path.join(video_dir, env_key)
+            if os.path.isdir(temp_video_dir) and len(os.listdir(temp_video_dir)) == 0:
+                os.rmdir(temp_video_dir)
 
-        # average metric across all episodes
         rollout_logs = dict((k, [rollout_logs[i][k] for i in range(len(rollout_logs))]) for k in rollout_logs[0])
         rollout_logs_mean = dict((k, np.mean(v)) for k, v in rollout_logs.items())
         rollout_logs_mean["Time_Episode"] = np.sum(rollout_logs["time"]) / 60. # total time taken for rollouts in minutes
         all_rollout_logs[env_key] = rollout_logs_mean
+        if combined_video_path is not None:
+            video_paths[env_key] = combined_video_path
 
     if video_path is not None:
-        # close video writer that was used for all envs
         video_writer.close()
 
     return all_rollout_logs, video_paths

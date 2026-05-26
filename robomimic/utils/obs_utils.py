@@ -26,6 +26,9 @@ OBS_MODALITIES_TO_KEYS = None
 # (e.g. low_dim, rgb)
 OBS_KEYS_TO_MODALITIES = None
 
+# Whether missing keys should emit a warning when they are auto-registered as low_dim.
+OBS_KEY_TO_MODALITY_WARN_ON_MISSING = True
+
 # DO NOT MODIFY THIS
 # This holds the default encoder kwargs that will be used if none are passed at runtime for any given network
 DEFAULT_ENCODER_KWARGS = None
@@ -76,8 +79,9 @@ class ObservationKeyToModalityDict(dict):
     def __getitem__(self, item):
         # If a key doesn't already exist, warn the user and add default mapping
         if item not in self.keys():
-            print(f"ObservationKeyToModalityDict: {item} not found,"
-                  f" adding {item} to mapping with assumed low_dim modality!")
+            if OBS_KEY_TO_MODALITY_WARN_ON_MISSING:
+                print(f"ObservationKeyToModalityDict: {item} not found,"
+                      f" adding {item} to mapping with assumed low_dim modality!")
             self.__setitem__(item, "low_dim")
         return super(ObservationKeyToModalityDict, self).__getitem__(item)
 
@@ -110,7 +114,7 @@ def obs_encoder_kwargs_from_config(obs_encoder_config):
     return dict(obs_encoder_config)
 
 
-def initialize_obs_modality_mapping_from_dict(modality_mapping):
+def initialize_obs_modality_mapping_from_dict(modality_mapping, verbose=True):
     """
     This function is an alternative to @initialize_obs_utils_with_obs_specs, that allows manually setting of modalities.
     NOTE: Only one of these should be called at runtime -- not both! (Note that all training scripts that use a config)
@@ -120,7 +124,9 @@ def initialize_obs_modality_mapping_from_dict(modality_mapping):
         modality_mapping (dict): Maps modality string names (e.g.: rgb, low_dim, etc.) to a list of observation
             keys that should belong to that modality
     """
-    global OBS_KEYS_TO_MODALITIES, OBS_MODALITIES_TO_KEYS
+    global OBS_KEYS_TO_MODALITIES, OBS_MODALITIES_TO_KEYS, OBS_KEY_TO_MODALITY_WARN_ON_MISSING
+
+    OBS_KEY_TO_MODALITY_WARN_ON_MISSING = verbose
 
     OBS_KEYS_TO_MODALITIES = ObservationKeyToModalityDict()
     OBS_MODALITIES_TO_KEYS = dict()
@@ -130,7 +136,7 @@ def initialize_obs_modality_mapping_from_dict(modality_mapping):
         OBS_KEYS_TO_MODALITIES.update({k: mod for k in keys})
 
 
-def initialize_obs_utils_with_obs_specs(obs_modality_specs):
+def initialize_obs_utils_with_obs_specs(obs_modality_specs, verbose=True):
     """
     This function should be called before using any observation key-specific
     functions in this file, in order to make sure that all utility
@@ -170,7 +176,9 @@ def initialize_obs_utils_with_obs_specs(obs_modality_specs):
             or a list of nested dictionaries. Accepting a list as input makes it convenient for
             situations where multiple modules may each have their own modality spec.
     """
-    global OBS_KEYS_TO_MODALITIES, OBS_MODALITIES_TO_KEYS
+    global OBS_KEYS_TO_MODALITIES, OBS_MODALITIES_TO_KEYS, OBS_KEY_TO_MODALITY_WARN_ON_MISSING
+
+    OBS_KEY_TO_MODALITY_WARN_ON_MISSING = verbose
 
     OBS_KEYS_TO_MODALITIES = ObservationKeyToModalityDict()
 
@@ -203,9 +211,10 @@ def initialize_obs_utils_with_obs_specs(obs_modality_specs):
     # remove duplicate entries and store in global mapping
     OBS_MODALITIES_TO_KEYS = { obs_modality : list(set(obs_modality_mapping[obs_modality])) for obs_modality in obs_modality_mapping }
 
-    print("\n============= Initialized Observation Utils with Obs Spec =============\n")
-    for obs_modality, obs_keys in OBS_MODALITIES_TO_KEYS.items():
-        print("using obs modality: {} with keys: {}".format(obs_modality, obs_keys))
+    if verbose:
+        print("\n============= Initialized Observation Utils with Obs Spec =============\n")
+        for obs_modality, obs_keys in OBS_MODALITIES_TO_KEYS.items():
+            print("using obs modality: {} with keys: {}".format(obs_modality, obs_keys))
 
 
 def initialize_default_obs_encoder(obs_encoder_config):
@@ -221,7 +230,7 @@ def initialize_default_obs_encoder(obs_encoder_config):
     DEFAULT_ENCODER_KWARGS = obs_encoder_kwargs_from_config(obs_encoder_config)
 
 
-def initialize_obs_utils_with_config(config):
+def initialize_obs_utils_with_config(config, verbose=True):
     """
     Utility function to parse config and call @initialize_obs_utils_with_obs_specs and
     @initialize_default_obs_encoder_kwargs with the correct arguments.
@@ -245,7 +254,7 @@ def initialize_obs_utils_with_config(config):
     else:
         obs_modality_specs = [config.observation.modalities]
         obs_encoder_config = config.observation.encoder
-    initialize_obs_utils_with_obs_specs(obs_modality_specs=obs_modality_specs)
+    initialize_obs_utils_with_obs_specs(obs_modality_specs=obs_modality_specs, verbose=verbose)
     initialize_default_obs_encoder(obs_encoder_config=obs_encoder_config)
 
 

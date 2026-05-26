@@ -35,6 +35,13 @@ class PrintLogger(object):
     def flush(self):
         # ensure stdout gets flushed
         self.terminal.flush()
+        self.log_file.flush()
+
+    def isatty(self):
+        return self.terminal.isatty()
+
+    def fileno(self):
+        return self.terminal.fileno()
 
 
 class DataLogger(object):
@@ -178,6 +185,7 @@ class custom_tqdm(tqdm):
     """
     def __init__(self, *args, **kwargs):
         assert "file" not in kwargs
+        kwargs.setdefault("disable", False)
         super(custom_tqdm, self).__init__(*args, file=sys.stdout, **kwargs)
 
 

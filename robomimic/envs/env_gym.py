@@ -26,6 +26,7 @@ class EnvGym(EB.EnvBase):
         render_offscreen=False, 
         use_image_obs=False, 
         use_depth_obs=False, 
+        verbose=True,
         **kwargs,
     ):
         """

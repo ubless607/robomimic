@@ -145,6 +145,7 @@ def create_env(
     use_image_obs=False, 
     use_depth_obs=False, 
     lang=None,
+    verbose=True,
     **kwargs,
 ):
     """
@@ -180,10 +181,12 @@ def create_env(
         use_image_obs=use_image_obs,
         use_depth_obs=use_depth_obs,
         lang=lang,
+        verbose=verbose,
         **kwargs,
     )
-    print("Created environment with name {}".format(env_name))
-    print("Action size is {}".format(env.action_dimension))
+    if verbose:
+        print("Created environment with name {}".format(env_name))
+        print("Action size is {}".format(env.action_dimension))
     return env
 
 
@@ -194,6 +197,7 @@ def create_env_from_metadata(
     render_offscreen=False, 
     use_image_obs=False, 
     use_depth_obs=False, 
+    verbose=True,
 ):
     """
     Create environment.
@@ -237,6 +241,7 @@ def create_env_from_metadata(
         use_image_obs=use_image_obs, 
         use_depth_obs=use_depth_obs, 
         lang=lang,
+        verbose=verbose,
         **env_kwargs,
     )
     check_env_version(env, env_meta)
@@ -254,6 +259,7 @@ def create_env_for_data_processing(
     render_offscreen=None, 
     use_image_obs=None, 
     use_depth_obs=None, 
+    verbose=True,
 ):
     """
     Creates environment for processing dataset observations and rewards.

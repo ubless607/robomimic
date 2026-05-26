@@ -44,6 +44,7 @@ class EnvGibsonMOMART(EB.EnvBase):
             image_width=None,
             physics_timestep=1./240.,
             action_timestep=1./20.,
+            verbose=True,
             **kwargs,
     ):
         """

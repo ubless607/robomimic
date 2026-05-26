@@ -383,6 +383,7 @@ def train(config, device, resume=False):
                 epoch=epoch,
                 video_skip=config.experiment.get("video_skip", 5),
                 terminate_on_success=config.experiment.rollout.terminate_on_success,
+                num_parallel_envs=config.experiment.rollout.num_parallel_envs,
             )
 
             # summarize results from rollouts to tensorboard and terminal
@@ -509,6 +510,9 @@ def main(args):
     res_str = "finished run successfully!"
     try:
         train(config, device=device, resume=args.resume)
+    except KeyboardInterrupt:
+        print("received Ctrl+C, terminating training")
+        raise SystemExit(130)
     except Exception as e:
         res_str = "run failed with error:\n{}\n\n{}".format(e, traceback.format_exc())
     print(res_str)

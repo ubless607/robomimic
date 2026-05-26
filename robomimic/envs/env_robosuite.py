@@ -4,31 +4,38 @@ to provide a standardized environment API for training policies and interacting
 with metadata present in datasets.
 """
 import json
+import contextlib
+import os
+import warnings
 import numpy as np
 from copy import deepcopy
 
-import robosuite
-import robosuite.utils.transform_utils as T
-try:
-    # this is needed for ensuring robosuite can find the additional mimicgen environments (see https://mimicgen.github.io)
-    import mimicgen
-except ImportError:
-    pass
-try:
-    # deprecated version of mimicgen
-    import mimicgen_envs
-except ImportError:
-    pass
-try:
-    # this is needed for ensuring robosuite can find the additional robocasa environments (see https://robocasa.ai)
-    import robocasa
-except ImportError:
-    pass
-try:
-    # try to import mimiclabs envs
-    from mimiclabs.mimiclabs.envs import *
-except ImportError:
-    pass
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    with open(os.devnull, "w") as devnull:
+        with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+            import robosuite
+            import robosuite.utils.transform_utils as T
+            try:
+                # this is needed for ensuring robosuite can find the additional mimicgen environments (see https://mimicgen.github.io)
+                import mimicgen
+            except ImportError:
+                pass
+            try:
+                # deprecated version of mimicgen
+                import mimicgen_envs
+            except ImportError:
+                pass
+            try:
+                # this is needed for ensuring robosuite can find the additional robocasa environments (see https://robocasa.ai)
+                import robocasa
+            except ImportError:
+                pass
+            try:
+                # try to import mimiclabs envs
+                from mimiclabs.mimiclabs.envs import *
+            except ImportError:
+                pass
 
 import robomimic.utils.obs_utils as ObsUtils
 import robomimic.utils.lang_utils as LangUtils
@@ -52,6 +59,7 @@ class EnvRobosuite(EB.EnvBase):
         use_image_obs=False, 
         use_depth_obs=False, 
         lang=None,
+        verbose=True,
         **kwargs,
     ):
         """
@@ -113,7 +121,14 @@ class EnvRobosuite(EB.EnvBase):
         self._env_name = env_name
 
         self._init_kwargs = deepcopy(kwargs)
-        self.env = robosuite.make(self._env_name, **kwargs)
+        if verbose:
+            self.env = robosuite.make(self._env_name, **kwargs)
+        else:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                with open(os.devnull, "w") as devnull:
+                    with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                        self.env = robosuite.make(self._env_name, **kwargs)
         self.lang = lang
         self._lang_emb = LangUtils.get_lang_emb(self.lang)
 
@@ -473,6 +488,7 @@ class EnvRobosuite(EB.EnvBase):
         render_offscreen=None, 
         use_image_obs=None, 
         use_depth_obs=None, 
+        verbose=True,
         **kwargs,
     ):
         """
@@ -533,7 +549,7 @@ class EnvRobosuite(EB.EnvBase):
         }
         if use_depth_obs:
             obs_modality_specs["obs"]["depth"] = depth_modalities
-        ObsUtils.initialize_obs_utils_with_obs_specs(obs_modality_specs)
+        ObsUtils.initialize_obs_utils_with_obs_specs(obs_modality_specs, verbose=verbose)
 
         return cls(
             env_name=env_name,
@@ -541,6 +557,7 @@ class EnvRobosuite(EB.EnvBase):
             render_offscreen=(has_camera if render_offscreen is None else render_offscreen), 
             use_image_obs=(has_camera if use_image_obs is None else use_image_obs), 
             use_depth_obs=use_depth_obs,
+            verbose=verbose,
             **kwargs,
         )
 
