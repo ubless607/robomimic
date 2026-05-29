@@ -350,6 +350,34 @@ def batchify_obs(obs_list):
     
     return obs
 
+def _set_random_seed(seed, env=None):
+    """
+    Seed all random number generators and the environment.
+    """
+    if seed is None:
+        return
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    # Try to seed the environment and its underlying layers if applicable
+    if env is not None:
+        for env_obj in [env, getattr(env, "env", None), getattr(env, "base_env", None)]:
+            if env_obj is not None:
+                if hasattr(env_obj, "seed"):
+                    try:
+                        env_obj.seed(seed)
+                    except Exception:
+                        pass
+                if hasattr(env_obj, "unwrapped") and hasattr(env_obj.unwrapped, "seed"):
+                    try:
+                        env_obj.unwrapped.seed(seed)
+                    except Exception:
+                        pass
+
 
 def run_rollout(
         policy, 
@@ -360,6 +388,7 @@ def run_rollout(
         video_writer=None,
         video_skip=5,
         terminate_on_success=False,
+        seed=None,
     ):
     """
     Runs a rollout in an environment with the current network parameters.
@@ -387,6 +416,9 @@ def run_rollout(
     """
     assert isinstance(policy, RolloutPolicy)
     assert isinstance(env, EnvBase) or isinstance(env, EnvWrapper)
+
+    if seed is not None:
+        _set_random_seed(seed, env=env)
 
     policy.start_episode()
 
@@ -600,6 +632,13 @@ def _run_rollout_chunk(
                 )
                 env_video_writer = imageio.get_writer(episode_video_path, fps=20)
 
+            base_seed = 0
+            if hasattr(policy, "policy") and hasattr(policy.policy, "global_config"):
+                config = policy.policy.global_config
+                if hasattr(config, "train") and hasattr(config.train, "seed"):
+                    base_seed = config.train.seed
+            seed = base_seed + episode_index
+
             rollout_timestamp = time.time()
             rollout_info = run_rollout(
                 policy=policy,
@@ -610,6 +649,7 @@ def _run_rollout_chunk(
                 video_writer=env_video_writer,
                 video_skip=video_skip,
                 terminate_on_success=terminate_on_success,
+                seed=seed,
             )
             rollout_info["time"] = time.time() - rollout_timestamp
             if env_video_writer is not None:
@@ -748,6 +788,13 @@ def rollout_with_stats(
 
             num_success = 0
             for ep_i in iterator:
+                base_seed = 0
+                if hasattr(policy, "policy") and hasattr(policy.policy, "global_config"):
+                    config = policy.policy.global_config
+                    if hasattr(config, "train") and hasattr(config.train, "seed"):
+                        base_seed = config.train.seed
+                seed = base_seed + ep_i
+
                 rollout_timestamp = time.time()
                 rollout_info = run_rollout(
                     policy=policy,
@@ -758,6 +805,7 @@ def rollout_with_stats(
                     video_writer=env_video_writer,
                     video_skip=video_skip,
                     terminate_on_success=terminate_on_success,
+                    seed=seed,
                 )
                 rollout_info["time"] = time.time() - rollout_timestamp
 
