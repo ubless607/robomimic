@@ -47,16 +47,7 @@ def get_torch_device(try_to_use_cuda):
         device (torch.Device): device to use for models
     """
     if try_to_use_cuda and torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.deterministic = True
-        if hasattr(torch, "use_deterministic_algorithms"):
-            try:
-                torch.use_deterministic_algorithms(True)
-            except RuntimeError:
-                try:
-                    torch.use_deterministic_algorithms(True, warn_only=True)
-                except Exception:
-                    pass
+        torch.backends.cudnn.benchmark = True
         device = torch.device("cuda:0")
     else:
         device = torch.device("cpu")
